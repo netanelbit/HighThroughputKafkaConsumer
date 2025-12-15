@@ -6,7 +6,7 @@ This project focuses on **throughput, reliability, and simplicity** — no over-
 
 ---
 
-## ✨ Key Features
+## Key Features
 
  **High throughput**
   - Processes messages concurrently with a configurable `MaxProcCount`
@@ -57,7 +57,7 @@ This project focuses on **throughput, reliability, and simplicity** — no over-
 
 ##  Requirements
 
-- .NET 10 (or later)
+- .NET 8 (or later)
 - `Confluent.Kafka`
 - ASP.NET / Generic Host
 
