@@ -80,7 +80,7 @@ var config = new ConsumerConfig
 
 services.AddHostedService(sp =>
     new HighThroughputKafkaConsumer<string, string>(
-        consumerConfig,
+        config,
         topic: "events",
         maxProcCount: Environment.ProcessorCount,
         handler: sp.GetRequiredService<IKafkaMessageHandler<string, string>>(),
