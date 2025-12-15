@@ -63,7 +63,7 @@ This project focuses on **throughput, reliability, and simplicity** — no over-
 
 ---
 
-##  Consumer Configuration (Required)
+##  Usage
 
 ```csharp
 var config = new ConsumerConfig
@@ -77,3 +77,13 @@ var config = new ConsumerConfig
     FetchWaitMaxMs = 50,
     FetchMinBytes = 1
 };
+
+services.AddHostedService(sp =>
+    new HighThroughputKafkaConsumer<string, string>(
+        consumerConfig,
+        topic: "events",
+        maxProcCount: Environment.ProcessorCount,
+        handler: sp.GetRequiredService<IKafkaMessageHandler<string, string>>(),
+        logger: sp.GetRequiredService<ILogger<HighThroughputKafkaConsumer<string, string>>>()
+    )
+);
