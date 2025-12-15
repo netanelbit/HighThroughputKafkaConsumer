@@ -1,13 +1,13 @@
-public interface IKafkaMessageHandler<TKey, TValue>
-{
-    Task HandleAsync(ConsumeResult<TKey, TValue> message, CancellationToken ct);
-}
-
 using Confluent.Kafka;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
 using System.Threading;
+
+public interface IKafkaMessageHandler<TKey, TValue>
+{
+    Task HandleAsync(ConsumeResult<TKey, TValue> message, CancellationToken ct);
+}
 
 public sealed class HighThroughputKafkaConsumer<TKey, TValue> : BackgroundService
 {
