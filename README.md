@@ -21,6 +21,7 @@ A robust, lightweight, and fault-tolerant Kafka Consumer implementation for ASP.
 dotnet add package Confluent.Kafka
 
 ⚙️ Configuration
+
 Add the following section to your appsettings.json. Adjust the values based on your workload requirements.
 {
   "Kafka": {
@@ -40,7 +41,9 @@ Configuration Parameters
 | MaxMsgCountBeforeCommit | The number of processed messages required to trigger a synchronous commit to Kafka. | 100 |
 | CommitIntervalSeconds | The maximum time to wait before forcing a commit, ensuring low-latency offset updates. | 30 |
 | EnableAutoCommit | Hardcoded to False. This consumer manages commits manually to ensure data integrity. | false |
+
 🛠️ Implementation Logic
+
 The "Sliding Window" Acknowledgment
 One of the biggest challenges in concurrent Kafka consumption is handling offsets when messages finish out of order.
 The Problem:
