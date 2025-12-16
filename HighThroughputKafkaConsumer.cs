@@ -1,179 +1,310 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using Confluent.Kafka;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using System.Collections.Concurrent;
-using System.Threading;
+using Microsoft.Extensions.Options;
 
-public interface IKafkaMessageHandler<TKey, TValue>
+namespace KafkaWorker
 {
-    Task HandleAsync(ConsumeResult<TKey, TValue> message, CancellationToken ct);
-}
-
-public sealed class HighThroughputKafkaConsumer<TKey, TValue> : BackgroundService
-{
-    private readonly IConsumer<TKey, TValue> _consumer;
-    private readonly IKafkaMessageHandler<TKey, TValue> _handler;
-    private readonly ILogger<HighThroughputKafkaConsumer<TKey, TValue>> _logger;
-
-    private readonly SemaphoreSlim _parallelism;
-    private readonly int _maxConcurrency;
-
-    private readonly ConcurrentDictionary<TopicPartition, long> _completedOffsets = new();
-    private readonly HashSet<TopicPartition> _assignedPartitions = new();
-
-    private readonly TimeSpan _commitInterval = TimeSpan.FromSeconds(30);
-    private DateTime _lastCommit = DateTime.UtcNow;
-
-    public HighThroughputKafkaConsumer(
-        ConsumerConfig config,
-        string topic,
-        int maxProcCount,
-        IKafkaMessageHandler<TKey, TValue> handler,
-        ILogger<HighThroughputKafkaConsumer<TKey, TValue>> logger)
+    // Configuration Model
+    public class KafkaConsumerConfig
     {
-        _handler = handler;
-        _logger = logger;
-        _maxConcurrency = maxProcCount;
-        _parallelism = new SemaphoreSlim(maxProcCount);
-
-        _consumer = new ConsumerBuilder<TKey, TValue>(config)
-            .SetPartitionsAssignedHandler(OnPartitionsAssigned)
-            .SetPartitionsRevokedHandler(OnPartitionsRevoked)
-            .SetErrorHandler((_, e) => _logger.LogError("Kafka error: {Error}", e))
-            .Build();
-
-        _consumer.Subscribe(topic);
+        public string BootstrapServers { get; set; } = "localhost:9092";
+        public string GroupId { get; set; } = "high-throughput-group";
+        public string Topic { get; set; } = "my-topic";
+        public int MaxProcCount { get; set; } = 50; // Concurrency Limit
+        public int MaxMsgCountBeforeCommit { get; set; } = 100; // Batch Size
+        public int CommitIntervalSeconds { get; set; } = 30; // Batch Time
+        public bool EnableAutoCommit { get; set; } = false; // Forced false
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    public class HighThroughputConsumer : BackgroundService
     {
-        try
+        private readonly ILogger<HighThroughputConsumer> _logger;
+        private readonly KafkaConsumerConfig _config;
+        private readonly IConsumer<Ignore, string> _consumer;
+        
+        // Throttling: Limits concurrent Task.Run executions
+        private readonly SemaphoreSlim _concurrencyLimiter;
+        
+        // Tracker: Tracks the state of every in-flight message per partition
+        private readonly ConcurrentDictionary<TopicPartition, PartitionOffsetTracker> _offsetTrackers 
+            = new ConcurrentDictionary<TopicPartition, PartitionOffsetTracker>();
+
+        private DateTime _lastCommitTime = DateTime.UtcNow;
+        private int _messagesProcessedSinceCommit = 0;
+
+        public HighThroughputConsumer(IOptions<KafkaConsumerConfig> config, ILogger<HighThroughputConsumer> logger)
         {
-            while (!stoppingToken.IsCancellationRequested)
+            _logger = logger;
+            _config = config.Value;
+            _concurrencyLimiter = new SemaphoreSlim(_config.MaxProcCount);
+
+            var consumerConfig = new ConsumerConfig
             {
-                await _parallelism.WaitAsync(stoppingToken);
+                BootstrapServers = _config.BootstrapServers,
+                GroupId = _config.GroupId,
+                EnableAutoCommit = false, // Critical: We manage commits manually
+                AutoOffsetReset = AutoOffsetReset.Earliest,
+                EnableAutoOffsetStore = false, // We store offsets only when contiguous logic allows
+                // Optimization for throughput
+                FetchWaitMaxMs = 50,
+                SocketReceiveBufferBytes = 1024 * 1024 
+            };
 
-                ConsumeResult<TKey, TValue>? msg = null;
-                try
+            _consumer = new ConsumerBuilder<Ignore, string>(consumerConfig)
+                .SetErrorHandler((_, e) => _logger.LogError($"Kafka Error: {e.Reason}"))
+                .SetPartitionsAssignedHandler((c, partitions) =>
                 {
-                    msg = _consumer.Consume(stoppingToken);
-                }
-                catch (ConsumeException ex)
+                    _logger.LogInformation($"Assigned partitions: [{string.Join(", ", partitions)}]");
+                    // Initialize trackers for new partitions
+                    foreach (var p in partitions)
+                    {
+                        _offsetTrackers.TryAdd(p, new PartitionOffsetTracker());
+                    }
+                })
+                .SetPartitionsRevokedHandler((c, partitions) =>
                 {
-                    _logger.LogError(ex, "Consume error");
-                    _parallelism.Release();
-                    continue;
-                }
+                    _logger.LogWarning($"Revoked partitions: [{string.Join(", ", partitions)}]");
+                    // Commit explicitly before losing ownership if possible
+                    CommitOffsets(c); 
+                    
+                    // Cleanup trackers to avoid memory leaks
+                    foreach (var p in partitions)
+                    {
+                        _offsetTrackers.TryRemove(p, out _);
+                    }
+                })
+                .Build();
+        }
 
-                if (msg == null)
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        {
+            _consumer.Subscribe(_config.Topic);
+            _logger.LogInformation("Consumer started. Waiting for messages...");
+
+            try
+            {
+                while (!stoppingToken.IsCancellationRequested)
                 {
-                    _parallelism.Release();
-                    continue;
+                    // 1. Wait for concurrency slot availability
+                    // We do this BEFORE Consume to apply backpressure. 
+                    // If max tasks are running, we stop pulling from Kafka.
+                    await _concurrencyLimiter.WaitAsync(stoppingToken);
+
+                    try
+                    {
+                        // 2. Consume with short timeout to allow Commit checks
+                        var consumeResult = _consumer.Consume(TimeSpan.FromMilliseconds(100));
+
+                        if (consumeResult == null || consumeResult.IsPartitionEOF)
+                        {
+                            // Slot not used, release immediately
+                            _concurrencyLimiter.Release(); 
+                            
+                            // Check if we need to commit based on time even if idle
+                            CheckAndCommit(force: false);
+                            continue;
+                        }
+
+                        // 3. Register message in tracker (Order is preserved here)
+                        var tracker = _offsetTrackers.GetOrAdd(consumeResult.TopicPartition, _ => new PartitionOffsetTracker());
+                        tracker.AddOffset(consumeResult.Offset);
+
+                        // 4. Offload processing to ThreadPool
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await ProcessMessage(consumeResult, stoppingToken);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "Error processing message");
+                                // Decide: Retry? DeadLetter? 
+                                // For this example, we mark complete to not block the queue, 
+                                // but in production, you might want a DLQ.
+                            }
+                            finally
+                            {
+                                // Mark as done in tracker
+                                tracker.MarkComplete(consumeResult.Offset);
+                                
+                                // Release slot for new message
+                                _concurrencyLimiter.Release();
+                                
+                                // Increment atomic counter for batch logic
+                                Interlocked.Increment(ref _messagesProcessedSinceCommit);
+                            }
+                        }, stoppingToken);
+
+                        // 5. Check if we need to commit
+                        CheckAndCommit(force: false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break; // StopAsync called
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error in Consume Loop");
+                        _concurrencyLimiter.Release(); // Ensure release on error
+                    }
                 }
-
-                _ = ProcessMessageAsync(msg, stoppingToken);
-
-                TryCommitByTime();
+            }
+            finally
+            {
+                // StopAsync logic hits here
+                await GracefulShutdown();
             }
         }
-        catch (OperationCanceledException)
+
+        // Simulate Business Logic
+        private async Task ProcessMessage(ConsumeResult<Ignore, string> result, CancellationToken token)
         {
-            // expected on shutdown
+            // Simulate variable workload duration
+            await Task.Delay(Random.Shared.Next(50, 200), token);
+            // _logger.LogDebug($"Processed: {result.TopicPartitionOffset}");
+        }
+
+        private void CheckAndCommit(bool force)
+        {
+            var now = DateTime.UtcNow;
+            var timeElapsed = (now - _lastCommitTime).TotalSeconds >= _config.CommitIntervalSeconds;
+            var countReached = _messagesProcessedSinceCommit >= _config.MaxMsgCountBeforeCommit;
+
+            if (force || timeElapsed || countReached)
+            {
+                CommitOffsets(_consumer);
+                _lastCommitTime = DateTime.UtcNow;
+                Interlocked.Exchange(ref _messagesProcessedSinceCommit, 0);
+            }
+        }
+
+        private void CommitOffsets(IConsumer<Ignore, string> consumer)
+        {
+            var offsetsToCommit = new List<TopicPartitionOffset>();
+
+            foreach (var kvp in _offsetTrackers)
+            {
+                var highestCommittable = kvp.Value.GetHighestCommittableOffset();
+                if (highestCommittable != null)
+                {
+                    // Commit offset + 1 because Kafka commit is "next offset to fetch"
+                    offsetsToCommit.Add(new TopicPartitionOffset(kvp.Key, highestCommittable.Value + 1));
+                }
+            }
+
+            if (offsetsToCommit.Any())
+            {
+                try
+                {
+                    consumer.Commit(offsetsToCommit);
+                    // _logger.LogInformation($"Committed {offsetsToCommit.Count} partition offsets.");
+                }
+                catch (KafkaException kex)
+                {
+                    _logger.LogError(kex, "Kafka Commit Error");
+                    // In a production loop, we continue. 
+                    // Next cycle will try to commit again (cumulative offsets).
+                }
+            }
+        }
+
+        private async Task GracefulShutdown()
+        {
+            _logger.LogInformation("Stopping... waiting for pending tasks.");
+
+            // 1. Wait for active tasks to drain
+            // We loop until Semaphore count equals MaxProcCount (all slots free)
+            // or a timeout occurs.
+            var timeout = DateTime.UtcNow.AddSeconds(10);
+            while (_concurrencyLimiter.CurrentCount < _config.MaxProcCount && DateTime.UtcNow < timeout)
+            {
+                await Task.Delay(100);
+            }
+
+            // 2. Final Commit
+            CommitOffsets(_consumer);
+
+            _consumer.Close();
+            _consumer.Dispose();
+            _logger.LogInformation("Consumer Stopped cleanly.");
         }
     }
 
-    private async Task ProcessMessageAsync(ConsumeResult<TKey, TValue> msg, CancellationToken ct)
+    /// <summary>
+    /// Tracks offsets for a single partition to ensure we never skip offsets.
+    /// Implements a "Sliding Window" of acknowledgments.
+    /// Thread-Safe.
+    /// </summary>
+    public class PartitionOffsetTracker
     {
-        try
+        private readonly object _lock = new object();
+        // Stores offsets in insertion order (FIFO)
+        private readonly LinkedList<long> _pendingOffsets = new LinkedList<long>();
+        // Fast lookup for marking complete O(1)
+        private readonly Dictionary<long, LinkedListNode<long>> _nodeLookup = new Dictionary<long, LinkedListNode<long>>();
+        // Set of completed offsets (waiting for the head to catch up)
+        private readonly HashSet<long> _completedOffsets = new HashSet<long>();
+        
+        private long? _highestCommittableOffset = null;
+
+        public void AddOffset(long offset)
         {
-            await _handler.HandleAsync(msg, ct);
-
-            // record completed offset (+1 because Kafka commit is "next offset")
-            _completedOffsets.AddOrUpdate(
-                msg.TopicPartition,
-                msg.Offset.Value + 1,
-                (_, current) => Math.Max(current, msg.Offset.Value + 1)
-            );
+            lock (_lock)
+            {
+                var node = _pendingOffsets.AddLast(offset);
+                _nodeLookup[offset] = node;
+            }
         }
-        catch (Exception ex)
+
+        public void MarkComplete(long offset)
         {
-            _logger.LogError(ex, "Message processing failed at {TopicPartitionOffset}", msg.TopicPartitionOffset);
-            // message will be reprocessed (no commit)
+            lock (_lock)
+            {
+                if (!_nodeLookup.ContainsKey(offset)) return; // Already processed or revoked
+
+                _completedOffsets.Add(offset);
+                
+                // Sliding Window Logic:
+                // We can only advance the committable offset if the HEAD of the list is complete.
+                // If the head is complete, we remove it and check the next one.
+                while (_pendingOffsets.First != null)
+                {
+                    var headOffset = _pendingOffsets.First.Value;
+                    
+                    if (_completedOffsets.Contains(headOffset))
+                    {
+                        // Head is done, move water mark up
+                        _highestCommittableOffset = headOffset;
+                        
+                        // Cleanup memory
+                        _completedOffsets.Remove(headOffset);
+                        _nodeLookup.Remove(headOffset);
+                        _pendingOffsets.RemoveFirst();
+                    }
+                    else
+                    {
+                        // Head is NOT done. We cannot commit anything beyond this point 
+                        // even if later messages are done.
+                        break;
+                    }
+                }
+            }
         }
-        finally
+
+        public Offset? GetHighestCommittableOffset()
         {
-            _parallelism.Release();
+            lock (_lock)
+            {
+                return _highestCommittableOffset.HasValue ? new Offset(_highestCommittableOffset.Value) : null;
+            }
         }
-    }
-
-    private void TryCommitByTime()
-    {
-        if (DateTime.UtcNow - _lastCommit < _commitInterval)
-            return;
-
-        CommitCompletedOffsets();
-        _lastCommit = DateTime.UtcNow;
-    }
-
-    private void CommitCompletedOffsets()
-    {
-        if (_completedOffsets.IsEmpty)
-            return;
-
-        var offsets = _completedOffsets
-            .Where(kv => _assignedPartitions.Contains(kv.Key))
-            .Select(kv => new TopicPartitionOffset(kv.Key, new Offset(kv.Value)))
-            .ToList();
-
-        if (offsets.Count == 0)
-            return;
-
-        try
-        {
-            _consumer.Commit(offsets);
-        }
-        catch (KafkaException ex)
-        {
-            _logger.LogError(ex, "Commit failed");
-        }
-    }
-
-    private void OnPartitionsAssigned(IConsumer<TKey, TValue> consumer, List<TopicPartition> partitions)
-    {
-        _assignedPartitions.Clear();
-        foreach (var p in partitions)
-            _assignedPartitions.Add(p);
-
-        _logger.LogInformation("Partitions assigned: {Partitions}", string.Join(",", partitions));
-    }
-
-    private void OnPartitionsRevoked(IConsumer<TKey, TValue> consumer, List<TopicPartitionOffset> partitions)
-    {
-        _logger.LogInformation("Partitions revoked, committing offsets");
-
-        CommitCompletedOffsets();
-
-        foreach (var p in partitions)
-            _assignedPartitions.Remove(p.TopicPartition);
-    }
-
-    public override async Task StopAsync(CancellationToken cancellationToken)
-    {
-        _logger.LogInformation("Stopping Kafka consumer...");
-
-        // stop polling
-        _consumer.Unsubscribe();
-
-        // wait for in-flight tasks
-        for (int i = 0; i < _maxConcurrency; i++)
-            await _parallelism.WaitAsync(cancellationToken);
-
-        // final commit
-        CommitCompletedOffsets();
-
-        _consumer.Close();
-        _consumer.Dispose();
-
-        await base.StopAsync(cancellationToken);
     }
 }
