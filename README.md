@@ -8,50 +8,25 @@ This project focuses on **throughput, reliability, and simplicity** — no over-
 
 ## Key Features
 
- **High throughput**
-  - Processes messages concurrently with a configurable `MaxProcCount`
-  - New tasks start immediately when others complete (work-conserving)
-
- **Safe & reliable offset management**
-  - `EnableAutoCommit = false`
-  - Offsets are committed **only after successful processing**
-  - Batch commits instead of per-message commits
-
-**Time-based + batch commits**
-  - Commits offsets every **30 seconds**
-  - Uses Kafka’s synchronous commit efficiently and sparingly
-
-**Rebalance-safe**
-  - Handles partition assignment and revocation correctly
-  - Commits offsets before partitions are revoked
-  - Never commits offsets for unassigned partitions
-
- **Low memory footprint**
-  - No channels, no queues, no buffering large batches
-  - Minimal allocations, minimal GC pressure
-
- **Graceful shutdown**
-  - Stops polling
-  - Waits for all in-flight tasks to finish
-  - Performs a final safe commit
-  - No message loss, no partial processing
-
- **Production ready**
-  - Handles commit failures, rebalance events, and consume errors
-  - Stable under heavy load
-  - Kafka-thread-safe design
-
----
-
-# Architecture Overview
-
-- **Single Kafka poll loop** (Kafka thread-safe)
-- **Bounded concurrency** using `SemaphoreSlim`
-- **Fire-and-forget processing tasks**
-- **Thread-safe offset tracking per partition**
-- **Periodic batch commits**
-- **Explicit rebalance handling**
-
+Strict Ordering ("No Skipping Offsets"):
+• (Conceptual Trigger)
+• The PartitionOffsetTracker is the core safety mechanism.
+• Example: Offsets 10, 11, 12 arrive. 12 finishes first. The tracker marks 12 as complete but keeps it in memory. 11 finishes. Still held. Finally, 10 finishes. The tracker loop sees 10 is done \rightarrow updates commit to 10. Sees 11 is done \rightarrow updates to 11. Sees 12 is done \rightarrow updates to 12.
+• This guarantees that if we crash, we resume from the earliest unfinished message.
+2. Concurrency Control:
+• SemaphoreSlim _concurrencyLimiter: This is superior to Parallel.ForEach for infinite streams. It pauses the Consume loop when MaxProcCount tasks are active (backpressure), preventing memory explosions.
+3. Low Memory Footprint:
+• We do not store the full Message object in the tracker, only the long offset.
+• We aggressively remove items from the LinkedList and Dictionary as soon as the "watermark" passes them.
+4. Batch Committing:
+• Commits happen in the main loop (CheckAndCommit) to ensure thread safety of the _consumer object.
+• It triggers only after MaxMsgCount or CommitInterval is reached.
+5. Fault Tolerance:
+• Rebalancing: SetPartitionsRevokedHandler cleans up trackers for partitions we lost ownership of so we don't try to commit invalid offsets later.
+• Graceful Shutdown: The StopAsync waits for the semaphore count to return to max (meaning all workers returned) and performs one final commit.
+6. Performance:
+• Using Task.Run allows CPU-bound or I/O-bound work to run without blocking the Kafka polling loop.
+• EnableAutoOffsetStore = false and EnableAutoCommit = false ensures zero overhead from the library trying to manage state we are managing ourselves.
 
 ---
 
@@ -66,24 +41,5 @@ This project focuses on **throughput, reliability, and simplicity** — no over-
 ##  Usage
 
 ```csharp
-var config = new ConsumerConfig
-{
-    BootstrapServers = "localhost:9092",
-    GroupId = "high-throughput-group",
-    EnableAutoCommit = false,
-    EnableAutoOffsetStore = false,
-    AutoOffsetReset = AutoOffsetReset.Earliest,
-    MaxPollIntervalMs = 300000,
-    FetchWaitMaxMs = 50,
-    FetchMinBytes = 1
-};
-
-services.AddHostedService(sp =>
-    new HighThroughputKafkaConsumer<string, string>(
-        config,
-        topic: "events",
-        maxProcCount: Environment.ProcessorCount,
-        handler: sp.GetRequiredService<IKafkaMessageHandler<string, string>>(),
-        logger: sp.GetRequiredService<ILogger<HighThroughputKafkaConsumer<string, string>>>()
-    )
-);
+builder.Services.Configure<KafkaConsumerConfig>(builder.Configuration.GetSection("Kafka"));
+builder.Services.AddHostedService<HighThroughputConsumer>();
