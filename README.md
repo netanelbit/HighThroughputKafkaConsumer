@@ -12,7 +12,9 @@ A robust, lightweight, and fault-tolerant Kafka Consumer implementation for ASP.
  * Batch Commits: Commits are aggregated and sent based on time intervals or batch size to reduce network overhead.
  * Graceful Shutdown: Implements StopAsync to drain active tasks and perform a final commit before the application exits.
  * Rebalancing Aware: Automatically handles partition assignment and revocation to clean up internal state.
+ * 
 📦 Dependencies
+
  * .NET SDK
  * Confluent.Kafka: The official .NET client for Apache Kafka.
 <!-- end list -->
@@ -78,11 +80,14 @@ private async Task ProcessMessage(ConsumeResult<Ignore, string> result, Cancella
 }
 
 🔍 Performance Tuning
+
  * Memory Footprint: The PartitionOffsetTracker stores only long (Int64) offsets. Even with 100,000 uncommitted messages in memory, the overhead is roughly only ~3MB.
  * Throughput: Throughput is primarily limited by your ProcessMessage logic and the MaxProcCount.
    * IO Bound Work: Increase MaxProcCount (e.g., 100-200).
    * CPU Bound Work: Keep MaxProcCount close to the number of CPU cores.
+   * 
 🛑 Graceful Shutdown
+
 When the application stops (e.g., SIGTERM in Kubernetes):
  * StopAsync is triggered.
  * The consumer loop breaks.
