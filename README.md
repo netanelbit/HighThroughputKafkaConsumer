@@ -1,6 +1,8 @@
 High-Throughput Concurrent Kafka Consumer (ASP.NET Core)
 A robust, lightweight, and fault-tolerant Kafka Consumer implementation for ASP.NET Core (targeting .NET 10+). This solution is designed as a BackgroundService that processes messages concurrently while strictly ensuring ordered commits and zero data loss.
+
 🚀 Key Features
+
  * High Concurrency: Processes messages in parallel up to a configurable MaxProcCount.
  * Backpressure Handling: Uses SemaphoreSlim to throttle consumption. If workers are busy, the consumer pauses fetching from Kafka to prevent memory overflow.
  * Resilient Offset Tracking (Sliding Window):
